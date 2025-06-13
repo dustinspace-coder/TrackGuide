@@ -8,6 +8,8 @@ class AudioService {
     this.samples = {};
     this.isPlaying = false;
     this.currentSequence = null;
+    this.activeVoices = [];
+    this.activeSamples = [];
   }
 
   async initialize() {
@@ -22,6 +24,7 @@ class AudioService {
       console.log('Audio service initialized');
     } catch (error) {
       console.error('Failed to initialize audio service:', error);
+      throw new Error('Audio initialization failed. Please check browser permissions.');
     }
   }
 
@@ -49,6 +52,11 @@ class AudioService {
       dampening: 4000,
       resonance: 0.7
     });
+    
+    // Connect synths to master output
+    Object.values(this.synths).forEach(synth => {
+      synth.toDestination();
+    });
   }
 
   setupEffects() {
@@ -56,73 +64,50 @@ class AudioService {
     this.effects.reverb = new Tone.Reverb({
       roomSize: 0.7,
       dampening: 3000
-    });
+    }).toDestination();
 
     // Delay
     this.effects.delay = new Tone.PingPongDelay({
       delayTime: '8n',
       feedback: 0.3,
       wet: 0.2
-    });
+    }).toDestination();
 
     // Filter
     this.effects.filter = new Tone.Filter({
       frequency: 1000,
       type: 'lowpass',
       rolloff: -24
-    });
+    }).toDestination();
 
     // Distortion
     this.effects.distortion = new Tone.Distortion({
       distortion: 0.4,
       oversample: '4x'
-    });
+    }).toDestination();
 
-    // Connect effects
+    // Connect synths to effects
     this.synths.lead.connect(this.effects.reverb);
-    this.synths.pad.connect(this.effects.reverb);
+    this.synths.pad.connect(this.effects.delay);
     this.synths.bass.connect(this.effects.filter);
     this.synths.pluck.connect(this.effects.delay);
-
-    // Connect to master
-    Object.values(this.effects).forEach(effect => {
-      effect.toDestination();
-    });
-
-    Object.values(this.synths).forEach(synth => {
-      if (!synth.output.connected) {
-        synth.toDestination();
-      }
-    });
   }
 
   setupDrumSamples() {
-    // Create basic drum sounds using oscillators
-    this.samples.kick = new Tone.MembraneSynth({
-      pitchDecay: 0.05,
-      octaves: 10,
-      oscillator: { type: 'sine' },
-      envelope: { attack: 0.001, decay: 0.4, sustain: 0.01, release: 1.4 }
-    });
-
-    this.samples.snare = new Tone.NoiseSynth({
-      noise: { type: 'white' },
-      envelope: { attack: 0.005, decay: 0.1, sustain: 0.0 }
-    });
-
-    this.samples.hihat = new Tone.MetalSynth({
-      frequency: 200,
-      envelope: { attack: 0.001, decay: 0.1, release: 0.01 },
-      harmonicity: 5.1,
-      modulationIndex: 32,
-      resonance: 4000,
-      octaves: 1.5
-    });
-
-    // Connect drums to destination
-    this.samples.kick.toDestination();
-    this.samples.snare.toDestination();
-    this.samples.hihat.toDestination();
+    this.samples.kick = new Tone.Player({
+      url: "/samples/kick.wav",
+      onload: () => console.log("Kick sample loaded")
+    }).toDestination();
+    
+    this.samples.snare = new Tone.Player({
+      url: "/samples/snare.wav",
+      onload: () => console.log("Snare sample loaded")
+    }).toDestination();
+    
+    this.samples.hihat = new Tone.Player({
+      url: "/samples/hihat.wav",
+      onload: () => console.log("Hi-hat sample loaded")
+    }).toDestination();
   }
 
   async playMidiPattern(pattern, options = {}) {
@@ -235,6 +220,43 @@ class AudioService {
     });
   }
 
+  playMidiSequence(midiData, tempo = 120) {
+    if (!this.isInitialized) {
+      console.error('Audio service not initialized');
+      return;
+    }
+    
+    this.stop(); // Stop any currently playing sequence
+    
+    Tone.Transport.bpm.value = tempo;
+    
+    const sequence = new Tone.Sequence((time, note) => {
+      if (!note) return;
+      
+      const { pitch, duration, velocity, instrument } = note;
+      const synth = this.synths[instrument] || this.synths.lead;
+      
+      // Play the note
+      synth.triggerAttackRelease(
+        Tone.Frequency(pitch).toFrequency(), 
+        duration, 
+        time, 
+        velocity / 127
+      );
+      
+      // Track active voices for proper cleanup
+      this.activeVoices.push({ synth, pitch, time: Tone.now() });
+      
+    }, midiData, '16n');
+    
+    this.currentSequence = sequence;
+    sequence.start(0);
+    Tone.Transport.start();
+    this.isPlaying = true;
+    
+    return true;
+  }
+
   stop() {
     if (this.currentSequence) {
       this.currentSequence.stop();
@@ -242,9 +264,22 @@ class AudioService {
       this.currentSequence = null;
     }
     
+    // Release all active voices
+    this.activeVoices.forEach(voice => {
+      voice.synth.triggerRelease(voice.pitch);
+    });
+    this.activeVoices = [];
+    
+    // Stop all active samples
+    this.activeSamples.forEach(sample => {
+      sample.stop();
+    });
+    this.activeSamples = [];
+    
     Tone.Transport.stop();
-    Tone.Transport.cancel();
     this.isPlaying = false;
+    
+    return true;
   }
 
   pause() {
@@ -258,54 +293,215 @@ class AudioService {
   }
 
   generateWavSample(type, options = {}) {
-    const {
-      duration = 2,
-      frequency = 440,
-      sampleRate = 44100,
-      bitDepth = 16
-    } = options;
-
-    return new Promise((resolve) => {
-      const recorder = new Tone.Recorder();
-      let source;
-
-      switch (type) {
-        case 'kick':
-          source = this.samples.kick;
-          break;
-        case 'snare':
-          source = this.samples.snare;
-          break;
-        case 'hihat':
-          source = this.samples.hihat;
-          break;
-        case 'bass':
-          source = this.synths.bass;
-          break;
-        case 'lead':
-          source = this.synths.lead;
-          break;
-        default:
-          source = this.synths.lead;
+    if (!this.isInitialized) {
+      await this.initialize();
+    }
+    
+    // Create an offline context for rendering audio
+    const duration = options.duration || 2;
+    const sampleRate = options.sampleRate || 44100;
+    
+    const offlineContext = new Tone.OfflineContext(
+      duration, 
+      sampleRate
+    );
+    
+    // Create appropriate synth based on sample type
+    let synth;
+    switch (type) {
+      case 'kick':
+        synth = new Tone.MembraneSynth({
+          pitchDecay: 0.05,
+          octaves: 5,
+          oscillator: { type: 'sine' },
+          envelope: {
+            attack: 0.001,
+            decay: 0.4,
+            sustain: 0.01,
+            release: 1.4,
+            attackCurve: 'exponential'
+          }
+        }).toDestination();
+        synth.triggerAttackRelease('C1', 0.3, 0);
+        break;
+        
+      case 'snare':
+        synth = new Tone.NoiseSynth({
+          noise: { type: 'white' },
+          envelope: {
+            attack: 0.001,
+            decay: 0.2,
+            sustain: 0.02,
+            release: 0.5
+          }
+        }).toDestination();
+        synth.triggerAttackRelease(0.1, 0);
+        break;
+        
+      case 'hihat':
+        synth = new Tone.MetalSynth({
+          frequency: 200,
+          envelope: {
+            attack: 0.001,
+            decay: 0.1,
+            release: 0.01
+          },
+          harmonicity: 5.1,
+          modulationIndex: 32,
+          resonance: 4000,
+          octaves: 1.5
+        }).toDestination();
+        synth.triggerAttackRelease('C6', 0.05, 0);
+        break;
+        
+      case 'bass':
+        synth = new Tone.MonoSynth({
+          oscillator: { type: 'square' },
+          envelope: {
+            attack: 0.02,
+            decay: 0.1,
+            sustain: 0.3,
+            release: 0.8
+          },
+          filterEnvelope: {
+            attack: 0.01,
+            decay: 0.3,
+            sustain: 0.5,
+            release: 0.5,
+            baseFrequency: 200,
+            octaves: 2.5
+          }
+        }).toDestination();
+        synth.triggerAttackRelease('C2', 1, 0);
+        break;
+        
+      case 'lead':
+        synth = new Tone.PolySynth(Tone.Synth, {
+          oscillator: { type: 'sawtooth' },
+          envelope: {
+            attack: 0.1,
+            decay: 0.2,
+            sustain: 0.5,
+            release: 0.8
+          }
+        }).toDestination();
+        synth.triggerAttackRelease(['C4', 'E4', 'G4'], 1, 0);
+        break;
+        
+      case 'pad':
+        synth = new Tone.PolySynth(Tone.Synth, {
+          oscillator: { type: 'sine' },
+          envelope: {
+            attack: 0.5,
+            decay: 0.3,
+            sustain: 0.7,
+            release: 2
+          }
+        }).toDestination();
+        synth.triggerAttackRelease(['C3', 'E3', 'G3', 'B3'], 2, 0);
+        break;
+        
+      default:
+        throw new Error(`Unknown sample type: ${type}`);
+    }
+    
+    // Apply effects if specified
+    if (options.effects) {
+      if (options.effects.reverb) {
+        const reverb = new Tone.Reverb({
+          decay: options.effects.reverb.decay || 1.5,
+          wet: options.effects.reverb.wet || 0.5
+        }).toDestination();
+        synth.connect(reverb);
       }
-
-      source.connect(recorder);
-      recorder.start();
-
-      // Trigger the sound
-      if (type === 'kick' || type === 'snare' || type === 'hihat') {
-        source.triggerAttackRelease('C2', duration);
-      } else {
-        source.triggerAttackRelease(frequency, duration);
+      
+      if (options.effects.delay) {
+        const delay = new Tone.PingPongDelay({
+          delayTime: options.effects.delay.time || 0.25,
+          feedback: options.effects.delay.feedback || 0.3,
+          wet: options.effects.delay.wet || 0.2
+        }).toDestination();
+        synth.connect(delay);
       }
-
-      setTimeout(async () => {
-        const recording = await recorder.stop();
-        const blob = new Blob([recording], { type: 'audio/wav' });
-        const url = URL.createObjectURL(blob);
-        resolve(url);
-      }, duration * 1000 + 100);
+    }
+    
+    // Render audio to buffer
+    const buffer = await offlineContext.render();
+    
+    // Convert to WAV
+    const wavBlob = this._bufferToWav(buffer, {
+      float32: true,
+      bitDepth: 32
     });
+    
+    return {
+      blob: wavBlob,
+      url: URL.createObjectURL(wavBlob),
+      type: type,
+      duration: duration
+    };
+  }
+
+  _bufferToWav(buffer, options = {}) {
+    const numberOfChannels = buffer.numberOfChannels;
+    const sampleRate = buffer.sampleRate;
+    const format = options.float32 ? 3 : 1;
+    const bitDepth = options.bitDepth || 16;
+    
+    let result;
+    if (format === 3) {
+      result = new Float32Array(buffer.length * numberOfChannels);
+    } else {
+      result = new Int16Array(buffer.length * numberOfChannels);
+    }
+    
+    // Interleave channels
+    for (let channel = 0; channel < numberOfChannels; channel++) {
+      const channelData = buffer.getChannelData(channel);
+      for (let i = 0; i < buffer.length; i++) {
+        result[(i * numberOfChannels) + channel] = 
+          format === 3 ? channelData[i] : channelData[i] * 32767;
+      }
+    }
+    
+    // Create WAV file
+    const dataSize = result.length * (bitDepth / 8);
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+    
+    // WAV header
+    writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeString(view, 8, 'WAVE');
+    writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, format, true);
+    view.setUint16(22, numberOfChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * numberOfChannels * (bitDepth / 8), true);
+    view.setUint16(32, numberOfChannels * (bitDepth / 8), true);
+    view.setUint16(34, bitDepth, true);
+    writeString(view, 36, 'data');
+    view.setUint32(40, dataSize, true);
+    
+    // Write audio data
+    if (format === 3) {
+      for (let i = 0; i < result.length; i++) {
+        view.setFloat32(44 + (i * 4), result[i], true);
+      }
+    } else {
+      for (let i = 0; i < result.length; i++) {
+        view.setInt16(44 + (i * 2), result[i], true);
+      }
+    }
+    
+    function writeString(view, offset, string) {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    }
+    
+    return new Blob([buffer], { type: 'audio/wav' });
   }
 
   downloadWavSample(url, filename = 'sample.wav') {
