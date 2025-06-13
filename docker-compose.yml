@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  music-producer-suite:
+    build: .
+    ports:
+      - "80:80"
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+    
+  # Optional: Add a reverse proxy with SSL
+  nginx-proxy:
+    image: nginx:alpine
+    ports:
+      - "443:443"
+    volumes:
+      - ./ssl:/etc/nginx/ssl
+      - ./proxy.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - music-producer-suite
+    restart: unless-stopped
